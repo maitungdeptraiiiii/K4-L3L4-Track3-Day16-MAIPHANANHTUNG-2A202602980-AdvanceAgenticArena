@@ -47,6 +47,10 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
+
+from harness.layers._evidence import sync_citations
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
@@ -62,17 +66,30 @@ class InjectionGuard(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§10): khoảng 8-15 dòng.
-        #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
-        #  2. Cắt từ BLOCK_START tới hết BLOCK_END, thay bằng PLACEHOLDER.
-        #     Nếu KHÔNG tìm thấy BLOCK_END (fetch bị cắt giữa chừng) thì
-        #     cắt từ BLOCK_START tới hết chuỗi.
-        #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
-        #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        content = result.content
+        if not isinstance(content, str) or (BLOCK_START not in content and INJECTION_CANARY not in content):
+            return result
+        removed = 0
+        while BLOCK_START in content:
+            start = content.find(BLOCK_START)
+            end = content.find(BLOCK_END, start)
+            # Fetch bị cắt (TRUNCATED) có thể mất dấu đóng: cắt tới hết chuỗi.
+            tail = content[end + len(BLOCK_END):] if end != -1 else ""
+            content = content[:start] + PLACEHOLDER + tail
+            removed += 1
+        # Canary lọt ngoài dấu mốc (vd. dấu mở bị cắt mất): gỡ nốt.
+        content = content.replace(INJECTION_CANARY, PLACEHOLDER)
+        ctx.state["injection_blocks_removed"] = ctx.state.get("injection_blocks_removed", 0) + removed
+        return ToolResult(ok=result.ok, content=content, error=result.error)
 
     def after_agent(self, ctx, report):
-        # TODO (§10): 2-4 dòng.
-        #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
-        #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        # `answer`/`verdict` viết lại được miễn phí; claim thì KHÔNG sửa chữ —
+        # claim nào mang canary thì bỏ hẳn (xoá là hợp lệ, sửa thì không).
+        for key in ("answer", "verdict"):
+            if isinstance(report.get(key), str) and INJECTION_CANARY in report[key]:
+                report[key] = report[key].replace(INJECTION_CANARY, "").strip()
+        claims = report.get("claims")
+        if isinstance(claims, list) and INJECTION_CANARY in str(claims):
+            report["claims"] = [c for c in claims if INJECTION_CANARY not in str(c)]
+            sync_citations(report)
+        return report

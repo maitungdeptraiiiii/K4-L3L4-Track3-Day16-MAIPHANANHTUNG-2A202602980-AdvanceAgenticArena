@@ -70,7 +70,31 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+
+from harness.layers._evidence import (
+    claim_doc_id,
+    claim_text,
+    find_source,
+    norm,
+    retrieved_docs,
+    supports,
+    sync_citations,
+)
 from harness.middleware import Middleware
+
+#: Chỗ dán hai nửa câu của hai nguồn. " và " là chỗ mô hình giả dán; các
+#: liên từ còn lại cho mô hình thật, vốn ghép câu theo nhiều kiểu hơn.
+SPLICES = (" và ", ", và ", "; ", ", nhưng ", " nhưng ", ", trong khi ", " trong khi ")
+
+#: Trần của scorer: quá 4 claim/tài liệu là REDUNDANT, quá 10 là EXCESS.
+MAX_CLAIMS_PER_DOC = 4
+MAX_CLAIMS = 10
+
+ABSTAIN_ANSWER = (
+    "Không đủ căn cứ: các tài liệu đã truy xuất không chứa thông tin "
+    "để trả lời câu hỏi này một cách đáng tin cậy."
+)
 
 
 class Critic(Middleware):
@@ -79,16 +103,62 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or ctx.corpus is None:
+            return report
+        docs = retrieved_docs(ctx)
+        retrieved_ids = {doc.doc_id for doc in docs}
+        kept, split_any = [], False
+        for claim in claims:
+            text = claim_text(claim)
+            if not text:
+                continue  # MALFORMED: bỏ
+            doc_id = claim_doc_id(claim)
+            if doc_id in retrieved_ids and supports(ctx.corpus.get(doc_id), text):
+                kept.append(claim)
+                continue
+            if find_source(docs, text) is not None:
+                # Câu CÓ trong bằng chứng, chỉ sai nguồn: MISATTRIBUTION là
+                # việc của `citation_checker`, không phải bịa — giữ nguyên.
+                kept.append(claim)
+                continue
+            halves = self._split(docs, text)
+            if halves:
+                kept += [{**claim, "text": half, "doc_id": doc.doc_id} for half, doc in halves]
+                split_any = True
+            # còn lại là bịa (HALLUCINATED): bỏ
+        report["claims"] = self._cap(kept)
+        ctx.state["critic_dropped"] = len(claims) - len(kept)
+        if split_any:
+            report["abstain"] = True  # hai nguồn mâu thuẫn: nêu cả hai phía rồi thận trọng
+        if not report["claims"]:
+            report["abstain"] = True
+            report["answer"] = ABSTAIN_ANSWER
+        sync_citations(report)
+        return report
+
+    @staticmethod
+    def _split(docs, text):
+        """Cắt câu ghép tại chỗ dán: hai nửa (là CHUỖI CON của chữ mô hình,
+        không sửa ký tự nào) phải nằm ở hai tài liệu khác nhau."""
+        for splice in SPLICES:
+            for match in re.finditer(re.escape(splice), text):
+                left, right = text[: match.start()].strip(), text[match.end():].strip()
+                left_doc, right_doc = find_source(docs, left), find_source(docs, right)
+                if left_doc and right_doc and left_doc.doc_id != right_doc.doc_id:
+                    return [(left, left_doc), (right, right_doc)]
+        return None
+
+    @staticmethod
+    def _cap(claims):
+        """Bỏ claim trùng và claim vượt trần REDUNDANT/EXCESS của scorer."""
+        out, seen, per_doc = [], set(), {}
+        for claim in claims:
+            doc_id = claim_doc_id(claim)
+            key = (norm(claim["text"]), doc_id)
+            if key in seen or per_doc.get(doc_id, 0) >= MAX_CLAIMS_PER_DOC or len(out) >= MAX_CLAIMS:
+                continue
+            seen.add(key)
+            per_doc[doc_id] = per_doc.get(doc_id, 0) + 1
+            out.append(claim)
+        return out
